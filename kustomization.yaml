@@ -1,0 +1,4 @@
+resources:
+  - deploy/app.yaml
+  - deploy/db/init.yaml
+  - deploy/db/mysql.yaml

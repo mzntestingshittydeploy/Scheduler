@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: scheduler-app
+  name: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scheduler-app
+  template:
+    metadata:
+      labels:
+        app: scheduler-app
+    spec:
+      containers:
+        - name: scheduler
+          image: scheduler
+          ports:
+            - containerPort: 80
+              name: scheduler
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduler-app
+  labels:
+    app: scheduler
+spec:
+  ports:
+    - port: 80
+  selector:
+    app: scheduler-app

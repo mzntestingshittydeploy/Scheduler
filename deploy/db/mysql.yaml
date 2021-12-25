@@ -1,0 +1,207 @@
+apiVersion: v1
+data:
+  initdb-sql.sql: |
+    CREATE TABLE IF NOT EXISTS Default.scheduledcomputation (
+    id INTEGER NOT NULL AUTO_INCREMENT,
+    user_id VARCHAR(255) NOT NULL,
+    memory_usage INTEGER NOT NULL,
+    vcpu_usage INTEGER NOT NULL,
+    mzn_file_id VARCHAR(255) NOT NULL,
+    dzn_file_id VARCHAR(255) DEFAULT NULL,
+    timeout_seconds INTEGER NOT NULL,
+    solver_options VARCHAR(255) DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY id_UNIQUE (id)
+    );
+
+    CREATE TABLE IF NOT EXISTS Default.scheduledcomputation_solver (
+    scheduledcomputation_id INTEGER NOT NULL,
+    solver_id INTEGER NOT NULL,
+    PRIMARY KEY (solver_id, scheduledcomputation_id)
+    );
+kind: ConfigMap
+metadata:
+  labels:
+    app: scheduler-mysql
+  name: scheduler-mysql-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: scheduler-mysql
+  name: scheduler-headless
+spec:
+  clusterIP: None
+  ports:
+  - name: mysql
+    port: 3306
+  - name: xtrabackup
+    port: 3307
+  selector:
+    app: scheduler-mysql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: scheduler-mysql
+  name: scheduler-mysql-read
+spec:
+  ports:
+  - name: mysql
+    port: 3306
+  selector:
+    app: scheduler-mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: scheduler-mysql
+  name: scheduler-mysql
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scheduler-mysql
+  serviceName: scheduler-headless
+  template:
+    metadata:
+      labels:
+        app: scheduler-mysql
+    spec:
+      containers:
+      - env:
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "1"
+        - name: MYSQL_DATABASE
+          value: Default
+        image: mysql:5.7
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        name: mysql
+        ports:
+        - containerPort: 3306
+          name: mysql
+        readinessProbe:
+          exec:
+            command:
+            - mysql
+            - -h
+            - 127.0.0.1
+            - -e
+            - SELECT 1
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: database-volume
+          subPath: mysql
+        - mountPath: /etc/mysql/conf.d
+          name: conf
+        - mountPath: /docker-entrypoint-initdb.d
+          name: mysql-init
+      - command:
+        - bash
+        - -c
+        - "set -ex\ncd /var/lib/mysql\n\n# Determine binlog position of cloned data,
+          if any.\nif [[ -f xtrabackup_slave_info && \"x$(<xtrabackup_slave_info)\"
+          != \"x\" ]]; then\n  # XtraBackup already generated a partial \"CHANGE MASTER
+          TO\" query\n  # because we're cloning from an existing replica. (Need to
+          remove the tailing semicolon!)\n  cat xtrabackup_slave_info | sed -E 's/;$//g'
+          > change_master_to.sql.in\n  # Ignore xtrabackup_binlog_info in this case
+          (it's useless).\n  rm -f xtrabackup_slave_info xtrabackup_binlog_info\nelif
+          [[ -f xtrabackup_binlog_info ]]; then\n  # We're cloning directly from primary.
+          Parse binlog position.\n  [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$
+          ]] || exit 1\n  rm -f xtrabackup_binlog_info xtrabackup_slave_info\n  echo
+          \"CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\\\n        MASTER_LOG_POS=${BASH_REMATCH[2]}\"
+          > change_master_to.sql.in\nfi\n\n# Check if we need to complete a clone
+          by starting replication.\nif [[ -f change_master_to.sql.in ]]; then\n  echo
+          \"Waiting for mysqld to be ready (accepting connections)\"\n  until mysql
+          -h 127.0.0.1 -e \"SELECT 1\"; do sleep 1; done\n\n  echo \"Initializing
+          replication from clone position\"\n  mysql -h 127.0.0.1 \\\n        -e \"$(<change_master_to.sql.in),
+          \\\n                MASTER_HOST='${HOSTNAME%-*}-0.${HOSTNAME%-*-*}-headless',
+          \\\n                MASTER_USER='root', \\\n                MASTER_PASSWORD='',
+          \\\n                MASTER_CONNECT_RETRY=10; \\\n              START SLAVE;\"
+          || exit 1\n  # In case of container restart, attempt this at-most-once.\n
+          \ mv change_master_to.sql.in change_master_to.sql.orig\nfi\n\n# Start a
+          server to send backups when requested by peers.\nexec ncat --listen --keep-open
+          --send-only --max-conns=1 3307 -c \\\n  \"xtrabackup --backup --slave-info
+          --stream=xbstream --host=127.0.0.1 --user=root\"          \n"
+        image: gcr.io/google-samples/xtrabackup:1.0
+        name: xtrabackup
+        ports:
+        - containerPort: 3307
+          name: xtrabackup
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: database-volume
+          subPath: mysql
+        - mountPath: /etc/mysql/conf.d
+          name: conf
+      initContainers:
+      - command:
+        - bash
+        - -c
+        - "set -ex\n# Generate mysql server-id from pod ordinal index.\n[[ `hostname`
+          =~ -([0-9]+)$ ]] || exit 1\nordinal=${BASH_REMATCH[1]}\necho [mysqld] >
+          /mnt/conf.d/server-id.cnf\n# Add an offset to avoid reserved server-id=0
+          value.\necho server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf\n#
+          Copy appropriate conf.d files from config-map to emptyDir.\nif [[ $ordinal
+          -eq 0 ]]; then\n  cp /mnt/config-map/primary.cnf /mnt/conf.d/\nelse\n  cp
+          /mnt/config-map/replica.cnf /mnt/conf.d/\nfi          \n"
+        image: mysql:5.7
+        name: init-mysql
+        volumeMounts:
+        - mountPath: /mnt/conf.d
+          name: conf
+        - mountPath: /mnt/config-map
+          name: config-map
+        - mountPath: /docker-entrypoint-initdb.d
+          name: mysql-init
+      - command:
+        - bash
+        - -c
+        - "set -ex\n# Skip the clone if data already exists.\n[[ -d /var/lib/mysql/mysql
+          ]] && exit 0\n# Skip the clone on primary (ordinal index 0).\n[[ `hostname`
+          =~ -([0-9]+)$ ]] || exit 1\nordinal=${BASH_REMATCH[1]}\n[[ $ordinal -eq
+          0 ]] && exit 0\n# Clone data from previous peer.\nncat --recv-only ${HOSTNAME%-*}-$(($ordinal-1)).${HOSTNAME%-*-*}-headless
+          3307 | xbstream -x -C /var/lib/mysql\n# Prepare the backup.\nxtrabackup
+          --prepare --target-dir=/var/lib/mysql         \n"
+        image: gcr.io/google-samples/xtrabackup:1.0
+        name: clone-mysql
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: database-volume
+          subPath: mysql
+        - mountPath: /etc/mysql/conf.d
+          name: conf
+      volumes:
+      - emptyDir: {}
+        name: conf
+      - configMap:
+          name: mysql
+        name: config-map
+      - configMap:
+          name: scheduler-mysql-init
+        name: mysql-init
+  volumeClaimTemplates:
+  - metadata:
+      labels:
+        app: scheduler-mysql
+      name: database-volume
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: database-data

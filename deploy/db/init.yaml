@@ -1,0 +1,34 @@
+# Defines a storage class to provide persistent volumes. 
+# Kubernetes and google compute allow for expansion of the volume which is here set to true.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: database-data
+provisioner: kubernetes.io/gce-pd
+parameters:
+  type: pd-standard
+  fstype: ext4
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Create a config map for mysql.
+# The primary.cnf config tells the database to create replication logs
+# The replica.cnf config sets the database to read-only
+# The primary.cnf is supposed to be for the ordinal 0, i.e. the primary database
+# and all other pods (replicas) in the same stateful sets should use the replica.cnf.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+data:
+  primary.cnf: |
+    # Apply this config only on the primary.
+    [mysqld]
+    log-bin    
+  replica.cnf: |
+    # Apply this config only on replicas.
+    [mysqld]
+    super-read-only  

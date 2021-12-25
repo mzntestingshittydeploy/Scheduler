@@ -1,0 +1,7 @@
+typing
+fastapi
+pydantic
+mysql.connector
+uvicorn[standard]
+python-dotenv
+requests
